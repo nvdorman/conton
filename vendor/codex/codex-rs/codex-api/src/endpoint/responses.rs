@@ -105,23 +105,19 @@ impl<T: HttpTransport> ResponsesClient<T> {
         if let Some(ref thread_id) = thread_id {
             insert_header(&mut headers, "x-client-request-id", thread_id);
         }
-        headers.extend(build_session_headers(session_id, thread_id.clone()));
         if let Some(subagent) = subagent_header(&session_source) {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
         }
         if codebuddy {
-            // Live RE conversation ids help sticky multi-turn on CodeBuddy edge.
-            if let Some(ref thread_id) = thread_id {
-                insert_header(&mut headers, "X-Conversation-ID", thread_id);
-                insert_header(&mut headers, "X-Conversation-Request-ID", thread_id);
+            // RE @tencent-ai/codebuddy-code@2.119.3 ModelProvider headers.
+            let conv = thread_id
+                .as_deref()
+                .or(session_id.as_deref());
+            for (name, value) in codebuddy_bridge::codebuddy_request_headers(conv, &request.model) {
+                insert_header(&mut headers, name, &value);
             }
-            insert_header(&mut headers, "X-Model-ID", &request.model);
-            insert_header(
-                &mut headers,
-                "User-Agent",
-                &format!("CodeBuddyCode/{}", env!("CARGO_PKG_VERSION")),
-            );
         }
+        headers.extend(build_session_headers(session_id, thread_id.clone()));
 
         if codebuddy {
             // CodeBuddy rejects zstd request bodies (magic 0x28 → parse error "invalid character '('").
@@ -200,6 +196,9 @@ impl<T: HttpTransport> ResponsesClient<T> {
             let mut raw_debug = String::new();
             let mut seeded_text_item = false;
             let mut fatal_err: Option<String> = None;
+            // RE CBC normalizeStreamingToolCallIds seen-id set
+            let mut seen_tool_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             while let Some(item) = tokio::time::timeout(idle, byte_stream.next())
                 .await
@@ -216,6 +215,11 @@ impl<T: HttpTransport> ResponsesClient<T> {
                     }
                 };
                 let chunk_str = String::from_utf8_lossy(&chunk);
+                // RE: strip duplicate tool_call ids before line parse
+                let chunk_str = codebuddy_bridge::normalize_streaming_tool_call_ids(
+                    &chunk_str,
+                    &mut seen_tool_ids,
+                );
                 if debug_stream && raw_debug.len() < 8000 {
                     raw_debug.push_str(&chunk_str);
                 }

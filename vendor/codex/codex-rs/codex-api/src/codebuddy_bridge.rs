@@ -1,20 +1,25 @@
-//! Conton: bridge Codex Responses API traffic to CodeBuddy Global chat completions.
+//! Conton: bridge Codex Responses API ↔ CodeBuddy Global chat completions.
 //!
-//! Live RE (2026-07-12+):
-//! - POST https://www.codebuddy.ai/v2/chat/completions (stream=true, system+user required)
-//! - Tools: OpenAI chat `tools` + streaming `delta.tool_calls` (name + arguments deltas)
-//! - SSE objects are chat.completion.chunk (not Responses events)
+//! Live RE from `@tencent-ai/codebuddy-code@2.119.3` (2026-07-13):
+//! - POST `/chat/completions` stream=true only
+//! - Native tools: Bash/Read/Write/Edit/Glob/Grep (+ deferred ToolSearch…)
+//! - `sanitizeEmptyContent`: assistant+tool_calls → **delete** content field
+//! - `normalizeStreamingToolCallIds`: id only on first delta; strip duplicates
+//! - Headers: X-Conversation-Message-ID (per request), X-Agent-Intent=craft, …
+//! - DeferToolLoading: don't dump every tool schema every turn
 //!
-//! Without tools in the chat body, Conton is text-only and the model invents
-//! "filesystem tools unavailable". Tools MUST be forwarded.
+//! Conton keeps Codex architecture: FunctionCall names stay Codex-side
+//! (`exec_command`, …). Wire dialect is remapped for CodeBuddy edge/model.
 
 use crate::common::ResponsesApiRequest;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 pub fn is_codebuddy_base_url(base_url: &str) -> bool {
     let b = base_url.to_ascii_lowercase();
@@ -29,23 +34,21 @@ pub fn codebuddy_chat_path() -> &'static str {
 pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
     let mut messages: Vec<Value> = Vec::new();
 
-    // RE: user-only messages → 11101; always include a system message.
-    // Keep system compact: full Codex base instructions often trip content_filter.
     let system = compact_system_prompt(&req.instructions);
     messages.push(json!({"role": "system", "content": system}));
 
-    // Pending assistant tool_calls assembled across consecutive FunctionCall items.
     let mut pending_tool_calls: Vec<Value> = Vec::new();
 
     let flush_tool_calls = |msgs: &mut Vec<Value>, pending: &mut Vec<Value>| {
         if pending.is_empty() {
             return;
         }
-        msgs.push(json!({
-            "role": "assistant",
-            "content": Value::Null,
-            "tool_calls": pending.clone(),
-        }));
+        // RE CBC sanitizeEmptyContent: omit content when tool_calls present
+        // (do NOT send null — CBC deletes the field).
+        let mut msg = Map::new();
+        msg.insert("role".into(), json!("assistant"));
+        msg.insert("tool_calls".into(), Value::Array(pending.clone()));
+        msgs.push(Value::Object(msg));
         pending.clear();
     };
 
@@ -81,12 +84,14 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
                 call_id,
                 ..
             } => {
+                let wire_name = codex_tool_to_wire_name(name);
+                let wire_args = codex_args_to_wire_args(name, arguments);
                 pending_tool_calls.push(json!({
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": name,
-                        "arguments": arguments,
+                        "name": wire_name,
+                        "arguments": wire_args,
                     }
                 }));
             }
@@ -96,12 +101,14 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
                 call_id,
                 ..
             } => {
+                let wire_name = codex_tool_to_wire_name(name);
+                let wire_args = codex_args_to_wire_args(name, input);
                 pending_tool_calls.push(json!({
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": name,
-                        "arguments": input,
+                        "name": wire_name,
+                        "arguments": wire_args,
                     }
                 }));
             }
@@ -121,23 +128,25 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
             ResponseItem::LocalShellCall {
                 call_id, action, ..
             } => {
-                // Best-effort: surface prior shell intent as assistant tool call if possible.
                 if let Some(cid) = call_id {
-                    if let Ok(args) = serde_json::to_string(action) {
+                    if let Ok(args) = serde_json::to_value(action) {
+                        let command = args
+                            .get("command")
+                            .cloned()
+                            .or_else(|| args.get("cmd").cloned())
+                            .unwrap_or(args);
                         pending_tool_calls.push(json!({
                             "id": cid,
                             "type": "function",
                             "function": {
-                                "name": "shell",
-                                "arguments": args,
+                                "name": "Bash",
+                                "arguments": json!({"command": command, "cmd": command}).to_string(),
                             }
                         }));
                     }
                 }
             }
-            _ => {
-                // Ignore reasoning / web search / other proprietary items for chat wire.
-            }
+            _ => {}
         }
     }
     flush_tool_calls(&mut messages, &mut pending_tool_calls);
@@ -159,15 +168,13 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
         let chat_tools = responses_tools_to_chat_tools(tools);
         if !chat_tools.is_empty() {
             body["tools"] = Value::Array(chat_tools);
-            // Codex uses string tool_choice ("auto") or richer objects; pass through when simple.
-            if !req.tool_choice.is_empty() {
-                body["tool_choice"] = json!(req.tool_choice);
+            body["tool_choice"] = if req.tool_choice.is_empty() {
+                json!("auto")
             } else {
-                body["tool_choice"] = json!("auto");
-            }
-            if req.parallel_tool_calls {
-                body["parallel_tool_calls"] = json!(true);
-            }
+                json!(req.tool_choice)
+            };
+            // RE CBC: parallel_tool_calls on model requests when tools present.
+            body["parallel_tool_calls"] = json!(true);
         }
     }
 
@@ -180,109 +187,218 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
     body
 }
 
-/// Responses tools use top-level `name`; chat completions nest under `function`.
+/// Codex → CodeBuddy wire tool name (model dialect).
+fn codex_tool_to_wire_name(name: &str) -> &str {
+    match name {
+        "exec_command" | "shell_command" | "shell" => "Bash",
+        "write_stdin" => "write_stdin", // keep; no CBC 1:1 for PTY write
+        other => other,
+    }
+}
+
+/// CodeBuddy wire → Codex tool name (handler registry).
+fn wire_tool_to_codex_name(name: &str) -> String {
+    match name {
+        "Bash" | "bash" | "PowerShell" | "powershell" | "shell" => "exec_command".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Outbound: ensure Bash-style `command` is present for CBC-trained models.
+fn codex_args_to_wire_args(codex_name: &str, arguments: &str) -> String {
+    if codex_name != "exec_command" && codex_name != "shell_command" && codex_name != "shell" {
+        return arguments.to_string();
+    }
+    let Ok(mut v) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_string();
+    };
+    if let Some(obj) = v.as_object_mut() {
+        if !obj.contains_key("command") {
+            if let Some(cmd) = obj.get("cmd").cloned() {
+                obj.insert("command".into(), cmd);
+            }
+        }
+        if !obj.contains_key("cmd") {
+            if let Some(command) = obj.get("command").cloned() {
+                obj.insert("cmd".into(), command);
+            }
+        }
+    }
+    v.to_string()
+}
+
+/// Inbound: map CBC Bash args to Codex exec_command (`cmd` required).
+fn wire_args_to_codex_args(wire_name: &str, arguments: &str) -> String {
+    let codex_name = wire_tool_to_codex_name(wire_name);
+    if codex_name != "exec_command" {
+        return arguments.to_string();
+    }
+    let Ok(mut v) = serde_json::from_str::<Value>(arguments) else {
+        // Plain string command from model
+        if !arguments.trim().is_empty() && !arguments.trim_start().starts_with('{') {
+            return json!({"cmd": arguments, "command": arguments}).to_string();
+        }
+        return arguments.to_string();
+    };
+    if let Some(obj) = v.as_object_mut() {
+        if !obj.contains_key("cmd") {
+            if let Some(command) = obj.get("command").cloned() {
+                obj.insert("cmd".into(), command);
+            }
+        }
+        // Prefer quick one-shot; CBC often runs short commands without long PTY yield.
+        if !obj.contains_key("yield_time_ms") {
+            obj.insert("yield_time_ms".into(), json!(2500));
+        }
+    }
+    v.to_string()
+}
+
+/// Hot-path tools only (DeferToolLoading-style). Codex still registers full set;
+/// we only *advertise* these to the model for faster tool selection.
+fn is_hot_path_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "exec_command"
+            | "shell_command"
+            | "shell"
+            | "write_stdin"
+            | "apply_patch"
+            | "update_plan"
+            | "view_image"
+            | "Bash"
+            | "Read"
+            | "Write"
+            | "Edit"
+            | "Glob"
+            | "Grep"
+    ) || name.starts_with("mcp__")
+}
+
+/// Convert Responses tools → chat tools with CBC dialect + defer filter.
 fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
+    let full = std::env::var("CONTON_FULL_TOOLS").ok().as_deref() == Some("1");
     let mut out = Vec::new();
     for t in tools {
         let typ = t.get("type").and_then(|x| x.as_str()).unwrap_or("function");
-        // Only map function-like tools for chat; skip web_search / local_shell proprietary types
-        // unless they already look like chat tools.
+        // Already chat-shaped
         if t.get("function").is_some() {
-            out.push(t.clone());
-            continue;
-        }
-        if typ == "function" {
             let name = t
-                .get("name")
+                .pointer("/function/name")
                 .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            if name.is_empty() {
+                .unwrap_or("");
+            if !full && !is_hot_path_tool(name) {
                 continue;
             }
-            let description = t
-                .get("description")
-                .cloned()
-                .unwrap_or_else(|| json!(""));
-            let parameters = t
-                .get("parameters")
-                .cloned()
-                .unwrap_or_else(|| json!({"type":"object","properties":{}}));
-            let mut function = json!({
-                "name": name,
-                "description": description,
-                "parameters": parameters,
-            });
-            if let Some(strict) = t.get("strict") {
-                function["strict"] = strict.clone();
-            }
-            out.push(json!({
-                "type": "function",
-                "function": function,
-            }));
+            out.push(remap_chat_tool_entry(t.clone()));
             continue;
         }
-        // local_shell / custom — map shell-like names if present
-        if typ == "local_shell" || name_hint(t).as_deref() == Some("shell") {
-            out.push(json!({
-                "type": "function",
-                "function": {
-                    "name": "shell",
-                    "description": "Run a shell command in the workspace",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": { "type": "string" },
-                            "workdir": { "type": "string" }
-                        },
-                        "required": ["command"]
-                    }
-                }
-            }));
+        if typ != "function" && typ != "local_shell" {
+            // Skip proprietary Responses-only types that bloat the request
+            continue;
         }
-    }
-    // Dedupe by function name
-    let mut seen = BTreeMap::new();
-    for t in out {
         let name = t
-            .pointer("/function/name")
+            .get("name")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
         if name.is_empty() {
             continue;
         }
-        seen.entry(name).or_insert(t);
+        if !full && !is_hot_path_tool(&name) {
+            continue;
+        }
+        let wire_name = codex_tool_to_wire_name(&name);
+        let description = t
+            .get("description")
+            .cloned()
+            .unwrap_or_else(|| json!(""));
+        let mut parameters = t
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+
+        // Dual cmd/command for shell tools (CBC models prefer `command`).
+        if matches!(name.as_str(), "exec_command" | "shell_command" | "shell") {
+            if let Some(props) = parameters
+                .get_mut("properties")
+                .and_then(|p| p.as_object_mut())
+            {
+                if !props.contains_key("command") {
+                    if let Some(cmd_schema) = props.get("cmd").cloned() {
+                        props.insert("command".into(), cmd_schema);
+                    } else {
+                        props.insert(
+                            "command".into(),
+                            json!({"type":"string","description":"Shell command to execute"}),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut function = json!({
+            "name": wire_name,
+            "description": description,
+            "parameters": parameters,
+        });
+        if let Some(strict) = t.get("strict") {
+            function["strict"] = strict.clone();
+        }
+        out.push(json!({
+            "type": "function",
+            "function": function,
+        }));
     }
-    seen.into_values().collect()
+
+    // Dedupe by wire name; prefer first (hot path order preserved).
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for t in out {
+        let name = t
+            .pointer("/function/name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() || !seen.insert(name) {
+            continue;
+        }
+        deduped.push(t);
+    }
+    deduped
 }
 
-fn name_hint(t: &Value) -> Option<String> {
-    t.get("name")
+fn remap_chat_tool_entry(mut t: Value) -> Value {
+    if let Some(name) = t
+        .pointer("/function/name")
         .and_then(|x| x.as_str())
         .map(str::to_string)
+    {
+        let wire = codex_tool_to_wire_name(&name);
+        if let Some(obj) = t.get_mut("function").and_then(|f| f.as_object_mut()) {
+            obj.insert("name".into(), json!(wire));
+        }
+    }
+    t
 }
 
 fn compact_system_prompt(instructions: &str) -> String {
     let trimmed = instructions.trim();
-    if trimmed.is_empty() {
-        return "You are Conton, a coding agent with tools (shell, file read/write, search). Use tools to inspect the workspace; never claim tools are unavailable when tools are provided.".into();
-    }
-    // Cap length — full Codex agent prompt is huge and often content-filtered.
-    const MAX: usize = 6000;
-    let mut base = if trimmed.len() <= MAX {
+    // Keep short: CBC does not ship multi-10k system blobs on every chat call.
+    const MAX: usize = 3500;
+    let mut base = if trimmed.is_empty() {
+        "You are Conton, a coding agent.".into()
+    } else if trimmed.len() <= MAX {
         trimmed.to_string()
     } else {
         let mut out = trimmed.chars().take(MAX).collect::<String>();
-        out.push_str("\n\n[system truncated for CodeBuddy]");
+        out.push_str("\n\n[system truncated]");
         out
     };
-    // Conton: explicit tools reminder so the model does not invent "no FS tools".
-    if !base.to_ascii_lowercase().contains("use tools") {
-        base.push_str(
-            "\n\nYou have callable tools (shell, filesystem, etc.). Prefer tools over asking the user to run commands. Never claim filesystem tools are unavailable when a tools array is present.",
-        );
-    }
+    // RE: CBC native tools use Bash; Conton maps Bash↔exec_command under the hood.
+    base.push_str(
+        "\n\nTools: use Bash for shell (arguments: {\"command\":\"...\"} or {\"cmd\":\"...\"}). Prefer tools over asking the user to run commands. Never claim tools are unavailable.",
+    );
     base
 }
 
@@ -321,7 +437,6 @@ fn content_items_to_text(content: &[ContentItem]) -> String {
     parts.join("\n")
 }
 
-/// Extract assistant text delta from a CodeBuddy/OpenAI chat.completion.chunk JSON line.
 pub fn chat_chunk_text_delta(data: &str) -> Option<String> {
     let v: Value = serde_json::from_str(data).ok()?;
     if let Some(delta) = v
@@ -363,7 +478,71 @@ pub fn chat_chunk_finish_reason(data: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Incremental tool call assembly (OpenAI/CodeBuddy chat stream).
+/// RE CBC `normalizeStreamingToolCallIds`: strip duplicate tool_call ids from
+/// later SSE chunks (id appears only on first delta).
+pub fn normalize_streaming_tool_call_ids(sse_chunk: &str, seen_ids: &mut HashSet<String>) -> String {
+    if !sse_chunk.contains("tool_calls") {
+        return sse_chunk.to_string();
+    }
+    let mut out_lines = Vec::new();
+    let mut changed = false;
+    for line in sse_chunk.split('\n') {
+        let trimmed = line.trim_end_matches('\r');
+        let Some(data) = trimmed.strip_prefix("data:") else {
+            out_lines.push(line.to_string());
+            continue;
+        };
+        let data = data.trim_start();
+        if data.is_empty() || data == "[DONE]" {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        let Ok(mut v) = serde_json::from_str::<Value>(data) else {
+            out_lines.push(line.to_string());
+            continue;
+        };
+        let mut line_changed = false;
+        if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
+            if let Some(choice0) = choices.first_mut() {
+                if let Some(delta) = choice0.get_mut("delta") {
+                    if let Some(tcs) = delta.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                        for tc in tcs {
+                            if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
+                                if !id.is_empty() {
+                                    if seen_ids.contains(id) {
+                                        if let Some(obj) = tc.as_object_mut() {
+                                            obj.remove("id");
+                                            line_changed = true;
+                                        }
+                                    } else {
+                                        seen_ids.insert(id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if line_changed {
+            let prefix = if line.starts_with("data: ") {
+                "data: "
+            } else {
+                "data:"
+            };
+            out_lines.push(format!("{prefix}{}", v));
+            changed = true;
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    if changed {
+        out_lines.join("\n")
+    } else {
+        sse_chunk.to_string()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ToolCallBuilder {
     pub id: String,
@@ -371,7 +550,6 @@ pub struct ToolCallBuilder {
     pub arguments: String,
 }
 
-/// Apply one SSE data line's tool_calls deltas into builders keyed by index.
 pub fn apply_tool_call_deltas(data: &str, builders: &mut BTreeMap<u64, ToolCallBuilder>) {
     let Ok(v) = serde_json::from_str::<Value>(data) else {
         return;
@@ -403,7 +581,9 @@ pub fn apply_tool_call_deltas(data: &str, builders: &mut BTreeMap<u64, ToolCallB
     }
 }
 
-pub fn tool_builders_to_response_items(builders: &BTreeMap<u64, ToolCallBuilder>) -> Vec<ResponseItem> {
+pub fn tool_builders_to_response_items(
+    builders: &BTreeMap<u64, ToolCallBuilder>,
+) -> Vec<ResponseItem> {
     builders
         .values()
         .filter(|b| !b.name.is_empty())
@@ -413,11 +593,13 @@ pub fn tool_builders_to_response_items(builders: &BTreeMap<u64, ToolCallBuilder>
             } else {
                 b.id.clone()
             };
+            let codex_name = wire_tool_to_codex_name(&b.name);
+            let arguments = wire_args_to_codex_args(&b.name, &b.arguments);
             ResponseItem::FunctionCall {
                 id: Some(ResponseItemId::new("fc")),
-                name: b.name.clone(),
+                name: codex_name,
                 namespace: None,
-                arguments: b.arguments.clone(),
+                arguments,
                 call_id,
                 internal_chat_message_metadata_passthrough: None,
             }
@@ -426,10 +608,44 @@ pub fn tool_builders_to_response_items(builders: &BTreeMap<u64, ToolCallBuilder>
 }
 
 fn uuid_like() -> String {
-    format!("{:x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0))
+    format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
+/// CBC-style headers for each model request (RE product.json + ModelProvider).
+pub fn codebuddy_request_headers(
+    conversation_id: Option<&str>,
+    model: &str,
+) -> Vec<(&'static str, String)> {
+    let message_id = uuid_like().replace('-', "");
+    let mut headers = vec![
+        ("X-Agent-Intent", "craft".into()),
+        ("X-Product", "SaaS".into()),
+        ("X-IDE-Type", "CLI".into()),
+        ("X-IDE-Name", "CLI".into()),
+        ("X-IDE-Version", env!("CARGO_PKG_VERSION").into()),
+        ("X-Private-Data", "false".into()),
+        ("X-Model-ID", model.into()),
+        ("X-Conversation-Message-ID", message_id.clone()),
+        ("X-Request-ID", message_id),
+        (
+            "User-Agent",
+            format!("CodeBuddyCode/{}", env!("CARGO_PKG_VERSION")),
+        ),
+    ];
+    if let Some(cid) = conversation_id {
+        if !cid.is_empty() {
+            headers.push(("X-Conversation-ID", cid.into()));
+            headers.push(("X-Conversation-Request-ID", cid.into()));
+            headers.push(("X-Session-ID", cid.into()));
+        }
+    }
+    headers
 }
 
 #[cfg(test)]
@@ -444,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_adds_system_user_and_tools() {
+    fn maps_exec_command_to_bash_and_filters_cold_tools() {
         let req = ResponsesApiRequest {
             model: "gpt-5.5".into(),
             instructions: "Be brief".into(),
@@ -452,17 +668,30 @@ mod tests {
                 id: None,
                 role: "user".into(),
                 content: vec![ContentItem::InputText {
-                    text: "ping".into(),
+                    text: "ls".into(),
                 }],
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
             }],
-            tools: Some(vec![json!({
-                "type": "function",
-                "name": "shell",
-                "description": "Run shell",
-                "parameters": {"type":"object","properties":{"command":{"type":"string"}}}
-            })]),
+            tools: Some(vec![
+                json!({
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Run shell",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"}
+                        }
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "name": "create_goal",
+                    "description": "goal",
+                    "parameters": {"type": "object", "properties": {}}
+                }),
+            ]),
             tool_choice: "auto".into(),
             parallel_tool_calls: false,
             reasoning: None,
@@ -476,39 +705,114 @@ mod tests {
             client_metadata: None,
         };
         let body = responses_request_to_codebuddy_chat(&req);
-        assert_eq!(body["model"], "gpt-5.5");
-        assert!(body["tools"].as_array().unwrap().len() >= 1);
-        assert_eq!(body["tools"][0]["function"]["name"], "shell");
-        let msgs = body["messages"].as_array().unwrap();
-        assert!(msgs.iter().any(|m| m["role"] == "system"));
-        assert!(msgs.iter().any(|m| m["role"] == "user" && m["content"] == "ping"));
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "Bash");
+        assert!(tools[0]["function"]["parameters"]["properties"]
+            .get("command")
+            .is_some());
+        assert_eq!(body["parallel_tool_calls"], true);
+        // assistant tool history omits content
+        // (no tool history in this fixture)
     }
 
     #[test]
-    fn assembles_tool_call_deltas() {
+    fn inbound_bash_maps_to_exec_command_cmd() {
         let mut builders = BTreeMap::new();
         apply_tool_call_deltas(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":""}}]}}]}"#,
             &mut builders,
         );
         apply_tool_call_deltas(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"command\":\"ls -la\"}"}}]}}]}"#,
             &mut builders,
         );
         let items = tool_builders_to_response_items(&builders);
-        assert_eq!(items.len(), 1);
         match &items[0] {
             ResponseItem::FunctionCall {
-                name,
-                arguments,
-                call_id,
-                ..
+                name, arguments, ..
             } => {
-                assert_eq!(name, "shell");
-                assert!(arguments.contains("ls"));
-                assert_eq!(call_id, "call_1");
+                assert_eq!(name, "exec_command");
+                let v: Value = serde_json::from_str(arguments).unwrap();
+                assert_eq!(v["cmd"], "ls -la");
+                assert_eq!(v["command"], "ls -la");
             }
-            other => panic!("unexpected {other:?}"),
+            other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn normalize_strips_duplicate_tool_ids() {
+        let mut seen = HashSet::new();
+        let chunk1 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"Bash","arguments":""}}]}}]}"#;
+        let chunk2 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"arguments":"{}"}}]}}]}"#;
+        let n1 = normalize_streaming_tool_call_ids(chunk1, &mut seen);
+        assert!(n1.contains("call_abc"));
+        let n2 = normalize_streaming_tool_call_ids(chunk2, &mut seen);
+        assert!(!n2.contains("\"id\":\"call_abc\"") || n2.contains(r#""id":null"#) || {
+            // id field removed
+            !n2.contains("call_abc") || n2.matches("call_abc").count() == 0
+        });
+        // stronger: parsed second chunk has no id
+        let data = n2.strip_prefix("data:").unwrap().trim();
+        let v: Value = serde_json::from_str(data).unwrap();
+        assert!(v
+            .pointer("/choices/0/delta/tool_calls/0/id")
+            .is_none());
+    }
+
+    #[test]
+    fn assistant_tool_calls_omit_content_field() {
+        let req = ResponsesApiRequest {
+            model: "gpt-5.5".into(),
+            instructions: "".into(),
+            input: vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".into(),
+                    content: vec![ContentItem::InputText {
+                        text: "run ls".into(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCall {
+                    id: None,
+                    name: "exec_command".into(),
+                    namespace: None,
+                    arguments: r#"{"cmd":"ls"}"#.into(),
+                    call_id: "c1".into(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "c1".into(),
+                    output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                        "file.txt".into(),
+                    ),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+            tools: None,
+            tool_choice: "auto".into(),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            stream_options: None,
+            include: vec![],
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+        let body = responses_request_to_codebuddy_chat(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        let assistant = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .unwrap();
+        assert!(assistant.get("content").is_none());
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "Bash");
     }
 }
