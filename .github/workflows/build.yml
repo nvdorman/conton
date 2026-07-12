@@ -1,0 +1,71 @@
+# Build Conton (Codex fork) on GitHub — prefer this over local LTO builds on low RAM.
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep peak RAM lower on free runners
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/codex/codex-rs -> target
+          # Shared key so PR/main rebuilds reuse deps
+          shared-key: conton-linux
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev build-essential
+
+      - name: Build release binary
+        working-directory: vendor/codex/codex-rs
+        run: |
+          # Avoid ultra-heavy full LTO if profile is painful; still release-optimized.
+          cargo build -p codex-cli --release
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp -a vendor/codex/codex-rs/target/release/codex dist/conton
+          chmod +x dist/conton
+          ./dist/conton --help | head -20 || true
+          ls -lh dist/conton
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: conton-linux-x86_64
+          path: dist/conton
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/conton
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

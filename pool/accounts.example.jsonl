@@ -1,0 +1,2 @@
+# One account per line (JSONL). Never commit real tokens.
+# {"id":"1","email":"a@example.com","access_token":"<jwt>","refresh_token":"<refresh>"}

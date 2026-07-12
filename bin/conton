@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Conton launcher — sessions always under ~/.conton (never ~/.codex).
+# Only runs Conton-patched vendor binary, never stock Codex.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Vendor resolution (standalone repo vs monorepo research/ tree):
+# 1) CONTON_VENDOR
+# 2) $ROOT/vendor/codex          (standalone: github.com/nvdorman/conton)
+# 3) $ROOT/../codex-cli          (captcha-solver/research/conton → research/codex-cli)
+# 4) $ROOT/../../research/codex-cli
+if [[ -n "${CONTON_VENDOR:-}" ]]; then
+  VENDOR="$CONTON_VENDOR"
+elif [[ -d "$ROOT/vendor/codex/codex-rs" ]]; then
+  VENDOR="$ROOT/vendor/codex"
+elif [[ -d "$ROOT/../codex-cli/codex-rs" ]]; then
+  VENDOR="$(cd "$ROOT/../codex-cli" && pwd)"
+elif [[ -d "$ROOT/../../research/codex-cli/codex-rs" ]]; then
+  VENDOR="$(cd "$ROOT/../../research/codex-cli" && pwd)"
+else
+  VENDOR="${CONTON_VENDOR:-$ROOT/vendor/codex}"
+fi
+
+RELEASE_DIR="${CONTON_RELEASE_DIR:-$ROOT/dist}"
+
+# Force Conton home — do not inherit a stale CODEX_HOME pointing at ~/.codex
+# unless the user explicitly set CONTON_ALLOW_EXTERNAL_HOME=1.
+if [[ "${CONTON_ALLOW_EXTERNAL_HOME:-0}" != "1" ]]; then
+  export CODEX_HOME="${CONTON_HOME:-$HOME/.conton}"
+else
+  export CODEX_HOME="${CODEX_HOME:-${CONTON_HOME:-$HOME/.conton}}"
+fi
+export CONTON_HOME="${CONTON_HOME:-$CODEX_HOME}"
+mkdir -p "$CODEX_HOME"
+
+# Seed Conton config (CodeBuddy auth + pool, no OpenAI / no Sub2API).
+if [[ ! -f "$CODEX_HOME/config.toml" ]]; then
+  if [[ -f "$ROOT/config/config.example.toml" ]]; then
+    cp "$ROOT/config/config.example.toml" "$CODEX_HOME/config.toml"
+    echo "[conton] wrote $CODEX_HOME/config.toml" >&2
+  fi
+fi
+
+# Prefer: CONTON_BIN → dist (CI artifact) → vendor release → vendor debug
+CANDIDATES=()
+if [[ -n "${CONTON_BIN:-}" ]]; then
+  CANDIDATES+=("$CONTON_BIN")
+fi
+CANDIDATES+=(
+  "$RELEASE_DIR/conton"
+  "$RELEASE_DIR/codex"
+  "$HOME/.local/bin/conton-bin"
+  "$VENDOR/codex-rs/target/release/codex"
+  "$VENDOR/codex-rs/target/debug/codex"
+)
+BIN=""
+for c in "${CANDIDATES[@]}"; do
+  if [[ -x "$c" ]]; then
+    BIN="$c"
+    break
+  fi
+done
+if [[ -z "$BIN" ]]; then
+  echo "[conton] ERROR: Conton binary not found." >&2
+  echo "  Vendor: $VENDOR" >&2
+  echo "  Options:" >&2
+  echo "    1) Download GitHub Actions artifact into $RELEASE_DIR/conton" >&2
+  echo "    2) Build: cd $VENDOR/codex-rs && cargo build -p codex-cli" >&2
+  echo "  Refusing stock Codex (~/.local/bin/codex)." >&2
+  exit 127
+fi
+
+case "$CODEX_HOME" in
+  */.codex|*/.codex/)
+    if [[ "${CONTON_ALLOW_CODEX_HOME:-0}" != "1" ]]; then
+      echo "[conton] ERROR: CODEX_HOME=$CODEX_HOME looks like default Codex home." >&2
+      echo "  Conton must use ~/.conton (or set CONTON_ALLOW_CODEX_HOME=1)." >&2
+      exit 2
+    fi
+    ;;
+esac
+
+case "$BIN" in
+  */.codex/*)
+    echo "[conton] ERROR: refusing stock Codex package binary: $BIN" >&2
+    exit 2
+    ;;
+esac
+
+echo "[conton] CODEX_HOME=$CODEX_HOME bin=$BIN" >&2
+exec "$BIN" "$@"

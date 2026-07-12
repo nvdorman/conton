@@ -1,0 +1,10 @@
+# Conton CLI — copy to ~/.conton/config.toml (launcher seeds this automatically)
+#
+# Auth = CodeBuddy Global JWT pool (conton_pool.jsonl + auth.json under ~/.conton).
+# Sessions write under CODEX_HOME=~/.conton only (never ~/.codex).
+
+model = "gpt-5.5"
+model_provider = "openai"
+model_reasoning_effort = "low"
+
+# Built-in openai + chatgpt auth points at https://www.codebuddy.ai in this fork.

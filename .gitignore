@@ -1,0 +1,28 @@
+# Build artifacts
+**/target/
+dist/
+*.rlib
+*.rmeta
+
+# Secrets / live pool (never commit JWTs)
+.env
+.env.*
+*.key
+*.pem
+pool/accounts.jsonl
+pool/state.json
+pool/current_token
+pool/conton_pool.jsonl
+config/local.toml
+
+# Runtime / local
+runs/*
+!runs/.gitkeep
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# Nested package managers
+node_modules/
+.pnpm-store/
