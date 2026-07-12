@@ -188,30 +188,18 @@ impl<T: HttpTransport> ResponsesClient<T> {
 
         tokio::spawn(async move {
             let _ = tx_event.send(Ok(ResponseEvent::Created)).await;
-            // Core turn loop requires OutputItemAdded before OutputTextDelta
-            // (else "OutputTextDelta without active item").
-            let assistant_id = ResponseItemId::new("msg");
-            let seed_item = ResponseItem::Message {
-                id: Some(assistant_id.clone()),
-                role: "assistant".into(),
-                content: vec![ContentItem::OutputText {
-                    text: String::new(),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            };
-            if tx_event
-                .send(Ok(ResponseEvent::OutputItemAdded(seed_item)))
-                .await
-                .is_err()
-            {
-                return;
-            }
 
             let mut full = String::new();
             let mut buffer = String::new();
             let mut done = false;
+            let mut finish_reason = String::new();
+            let mut tool_builders: std::collections::BTreeMap<
+                u64,
+                codebuddy_bridge::ToolCallBuilder,
+            > = std::collections::BTreeMap::new();
             let mut raw_debug = String::new();
+            let mut seeded_text_item = false;
+            let mut fatal_err: Option<String> = None;
 
             while let Some(item) = tokio::time::timeout(idle, byte_stream.next())
                 .await
@@ -243,33 +231,45 @@ impl<T: HttpTransport> ResponsesClient<T> {
                         continue;
                     }
                     let data = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
-                    if data == "[DONE]" || codebuddy_bridge::chat_chunk_finished(data) {
-                        // Still try to take final content on the finish chunk.
-                        if let Some(delta) = codebuddy_bridge::chat_chunk_text_delta(data) {
-                            full.push_str(&delta);
-                        }
+                    if data == "[DONE]" {
                         done = true;
                         break;
                     }
+                    codebuddy_bridge::apply_tool_call_deltas(data, &mut tool_builders);
                     if let Some(delta) = codebuddy_bridge::chat_chunk_text_delta(data) {
-                        // Accumulate only — emit once via OutputItemDone to avoid
-                        // double-printing the same text in exec/TUI.
+                        if !seeded_text_item {
+                            let seed = ResponseItem::Message {
+                                id: Some(ResponseItemId::new("msg")),
+                                role: "assistant".into(),
+                                content: vec![ContentItem::OutputText {
+                                    text: String::new(),
+                                }],
+                                phase: None,
+                                internal_chat_message_metadata_passthrough: None,
+                            };
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::OutputItemAdded(seed)))
+                                .await;
+                            seeded_text_item = true;
+                        }
                         full.push_str(&delta);
                     }
-                    // Surface structured API errors (credit/auth/params).
+                    if let Some(fr) = codebuddy_bridge::chat_chunk_finish_reason(data) {
+                        finish_reason = fr;
+                        done = true;
+                        break;
+                    }
                     if full.is_empty()
+                        && tool_builders.is_empty()
                         && (data.contains("Credits exhausted")
                             || data.contains("11216")
                             || data.contains("TrialExpired")
                             || data.contains("error_msg")
                             || (data.contains("\"code\"") && data.contains("\"msg\"")))
                     {
-                        let _ = tx_event
-                            .send(Err(ApiError::Stream(format!(
-                                "codebuddy api error: {data}"
-                            ))))
-                            .await;
-                        return;
+                        fatal_err = Some(format!("codebuddy api error: {data}"));
+                        done = true;
+                        break;
                     }
                 }
                 if done {
@@ -277,56 +277,83 @@ impl<T: HttpTransport> ResponsesClient<T> {
                 }
             }
 
-            // Flush trailing buffer without final newline.
             if !done && !buffer.trim().is_empty() {
                 let data = buffer
                     .trim()
                     .strip_prefix("data:")
                     .map(str::trim)
                     .unwrap_or(buffer.trim());
-                if let Some(delta) = codebuddy_bridge::chat_chunk_text_delta(data) {
-                    full.push_str(&delta);
-                } else if full.is_empty()
-                    && (data.contains("\"code\"")
-                        || data.contains("error_msg")
-                        || data.contains("\"msg\""))
-                {
-                    let _ = tx_event
-                        .send(Err(ApiError::Stream(format!(
-                            "codebuddy api error: {data}"
-                        ))))
-                        .await;
-                    return;
+                if data != "[DONE]" {
+                    codebuddy_bridge::apply_tool_call_deltas(data, &mut tool_builders);
+                    if let Some(delta) = codebuddy_bridge::chat_chunk_text_delta(data) {
+                        full.push_str(&delta);
+                    }
+                    if let Some(fr) = codebuddy_bridge::chat_chunk_finish_reason(data) {
+                        finish_reason = fr;
+                    }
                 }
+            }
+
+            if let Some(err) = fatal_err {
+                let _ = tx_event.send(Err(ApiError::Stream(err))).await;
+                return;
             }
 
             if debug_stream {
                 let _ = std::fs::write(
                     "/tmp/conton_stream_resp.txt",
                     format!(
-                        "full_len={} full={:?}\nraw_head={}\n",
+                        "finish={finish_reason:?} full_len={} tools={} full={:?}\nraw_head={}\n",
                         full.len(),
+                        tool_builders.len(),
                         full.chars().take(200).collect::<String>(),
                         raw_debug.chars().take(4000).collect::<String>()
                     ),
                 );
             }
 
-            // Always put full text on Done so last_agent_message / session
-            // rollout stay correct (deltas alone are not enough for some sinks).
-            let item = ResponseItem::Message {
-                id: Some(assistant_id),
-                role: "assistant".into(),
-                content: vec![ContentItem::OutputText { text: full }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            };
-            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+            // Prefer tool calls when present (model may also emit empty text).
+            let tool_items = codebuddy_bridge::tool_builders_to_response_items(&tool_builders);
+            if !tool_items.is_empty() {
+                for item in tool_items {
+                    let _ = tx_event
+                        .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
+                        .await;
+                    let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                }
+                let _ = tx_event
+                    .send(Ok(ResponseEvent::Completed {
+                        response_id: format!("conton_{}", conton_uuid_like()),
+                        token_usage: None,
+                        // false → core runs tools and samples again
+                        end_turn: Some(false),
+                    }))
+                    .await;
+                return;
+            }
+
+            if !full.is_empty() || seeded_text_item {
+                let item = ResponseItem::Message {
+                    id: Some(ResponseItemId::new("msg")),
+                    role: "assistant".into(),
+                    content: vec![ContentItem::OutputText { text: full }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                };
+                if !seeded_text_item {
+                    let _ = tx_event
+                        .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
+                        .await;
+                }
+                let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+            }
+
+            let end_turn = !matches!(finish_reason.as_str(), "tool_calls" | "function_call");
             let _ = tx_event
                 .send(Ok(ResponseEvent::Completed {
                     response_id: format!("conton_{}", conton_uuid_like()),
                     token_usage: None,
-                    end_turn: Some(true),
+                    end_turn: Some(end_turn),
                 }))
                 .await;
         });
