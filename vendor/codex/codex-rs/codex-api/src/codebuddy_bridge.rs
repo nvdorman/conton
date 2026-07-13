@@ -61,6 +61,11 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
                 if text.is_empty() {
                     continue;
                 }
+                // Collapse env XML → one line; drop other host policy blobs.
+                if let Some(compressed) = compress_environment_context(text) {
+                    messages.push(json!({"role": "user", "content": compressed}));
+                    continue;
+                }
                 if is_host_policy_blob(text) {
                     continue;
                 }
@@ -256,23 +261,27 @@ fn wire_args_to_codex_args(wire_name: &str, arguments: &str) -> String {
 
 /// Hot-path tools only (DeferToolLoading-style). Codex still registers full set;
 /// we only *advertise* these to the model for faster tool selection.
+///
+/// Default = Bash-only (+ apply_patch when present). Measured: advertising goals/MCP
+/// tools on every turn adds schema tokens and slows tool choice vs CBC defer loading.
+/// Override with CONTON_FULL_TOOLS=1.
 fn is_hot_path_tool(name: &str) -> bool {
+    if std::env::var("CONTON_FULL_TOOLS").ok().as_deref() == Some("1") {
+        return true;
+    }
     matches!(
         name,
         "exec_command"
             | "shell_command"
             | "shell"
-            | "write_stdin"
             | "apply_patch"
-            | "update_plan"
-            | "view_image"
             | "Bash"
             | "Read"
             | "Write"
             | "Edit"
             | "Glob"
             | "Grep"
-    ) || name.starts_with("mcp__")
+    )
 }
 
 /// Convert Responses tools → chat tools with CBC dialect + defer filter.
@@ -383,23 +392,15 @@ fn remap_chat_tool_entry(mut t: Value) -> Value {
 }
 
 fn compact_system_prompt(instructions: &str) -> String {
-    let trimmed = instructions.trim();
-    // Keep short: CBC does not ship multi-10k system blobs on every chat call.
-    const MAX: usize = 3500;
-    let mut base = if trimmed.is_empty() {
-        "You are Conton, a coding agent.".into()
-    } else if trimmed.len() <= MAX {
-        trimmed.to_string()
-    } else {
-        let mut out = trimmed.chars().take(MAX).collect::<String>();
-        out.push_str("\n\n[system truncated]");
-        out
-    };
-    // RE: CBC native tools use Bash; Conton maps Bash↔exec_command under the hood.
-    base.push_str(
-        "\n\nTools: use Bash for shell (arguments: {\"command\":\"...\"} or {\"cmd\":\"...\"}). Prefer tools over asking the user to run commands. Never claim tools are unavailable.",
-    );
-    base
+    // RE: CBC agent system is product-side, not a 20k Codex personality dump.
+    // Live Conton dumps of truncated Codex were ~3.5–6k tokens of dead weight and
+    // dominate TTFT vs CBC (API pong ~3.5s pure; Conton wall ~13s).
+    // Keep a short fixed Conton system; ignore long Codex base instructions.
+    let _ = instructions;
+    "You are Conton, a coding agent (CodeBuddy-backed). Be concise. \
+Use Bash for shell commands with JSON args {\"cmd\":\"...\"} or {\"command\":\"...\"}. \
+Prefer tools over asking the user to run commands. Never claim tools are unavailable when tools are provided."
+        .to_string()
 }
 
 fn is_host_policy_blob(text: &str) -> bool {
@@ -407,17 +408,48 @@ fn is_host_policy_blob(text: &str) -> bool {
         || text.contains("<skills_instructions>")
         || text.contains("<collaboration_mode>")
         || text.contains("# AGENTS.md instructions")
-        || (text.starts_with("<") && text.contains("instructions>") && text.len() > 500)
+        || text.contains("<environment_context>")
+        || text.contains("<filesystem>")
+        || text.contains("<permission_profile")
+        || (text.starts_with("<") && text.contains("instructions>") && text.len() > 200)
+}
+
+/// Collapse Codex environment dumps to a single cwd line (CBC does not ship FS policy XML).
+fn compress_environment_context(text: &str) -> Option<String> {
+    if !text.contains("<environment_context>") && !text.contains("<cwd>") {
+        return None;
+    }
+    let cwd = text
+        .split("<cwd>")
+        .nth(1)
+        .and_then(|s| s.split("</cwd>").next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let shell = text
+        .split("<shell>")
+        .nth(1)
+        .and_then(|s| s.split("</shell>").next())
+        .map(str::trim)
+        .unwrap_or("bash");
+    Some(match cwd {
+        Some(c) => format!("Working directory: {c} (shell={shell})"),
+        None => format!("Shell: {shell}"),
+    })
 }
 
 fn reasoning_effort_str(reasoning: &crate::common::Reasoning) -> Option<&'static str> {
+    // RE CBC product.json + UI: efforts are minimal|low|medium|high|xhigh|max.
+    // Do NOT collapse xhigh→high — Conton previously sent high while user set xhigh.
     let v = serde_json::to_value(reasoning).ok()?;
     let effort = v.get("effort").and_then(|e| e.as_str())?;
     Some(match effort {
-        "none" | "minimal" | "low" => "low",
+        "none" | "minimal" => "minimal",
+        "low" => "low",
         "medium" => "medium",
-        "high" | "xhigh" | "max" => "high",
-        other if !other.is_empty() => "high",
+        "high" => "high",
+        "xhigh" | "x-high" | "extra_high" => "xhigh",
+        "max" => "max",
+        _ if !effort.is_empty() => "high",
         _ => return None,
     })
 }
@@ -691,6 +723,12 @@ mod tests {
                     "description": "goal",
                     "parameters": {"type": "object", "properties": {}}
                 }),
+                json!({
+                    "type": "function",
+                    "name": "write_stdin",
+                    "description": "pty",
+                    "parameters": {"type": "object", "properties": {}}
+                }),
             ]),
             tool_choice: "auto".into(),
             parallel_tool_calls: false,
@@ -706,14 +744,61 @@ mod tests {
         };
         let body = responses_request_to_codebuddy_chat(&req);
         let tools = body["tools"].as_array().unwrap();
+        // Bash only by default (write_stdin/create_goal filtered)
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "Bash");
         assert!(tools[0]["function"]["parameters"]["properties"]
             .get("command")
             .is_some());
         assert_eq!(body["parallel_tool_calls"], true);
-        // assistant tool history omits content
-        // (no tool history in this fixture)
+        // short system, not full Codex dump
+        let sys = body["messages"][0]["content"].as_str().unwrap();
+        assert!(sys.len() < 800, "system too long: {}", sys.len());
+        assert!(sys.contains("Bash"));
+    }
+
+    #[test]
+    fn compresses_environment_context() {
+        let req = ResponsesApiRequest {
+            model: "gpt-5.5".into(),
+            instructions: "".into(),
+            input: vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".into(),
+                    content: vec![ContentItem::InputText {
+                        text: "<environment_context><cwd>/tmp/x</cwd><shell>bash</shell></environment_context>".into(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".into(),
+                    content: vec![ContentItem::InputText {
+                        text: "hi".into(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+            tools: None,
+            tool_choice: "auto".into(),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            stream_options: None,
+            include: vec![],
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+        let body = responses_request_to_codebuddy_chat(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        let env = msgs.iter().find(|m| m["content"].as_str().unwrap_or("").contains("Working directory")).unwrap();
+        assert!(env["content"].as_str().unwrap().contains("/tmp/x"));
     }
 
     #[test]

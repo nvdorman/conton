@@ -82,6 +82,15 @@ impl OpenAiModelsEndpoint {
         let auth = self.auth().await;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
         let api_provider = self.provider_info.to_api_provider(auth_mode)?;
+        // Conton/CodeBuddy: live edge has no OpenAI `/models` route (always 404).
+        // RE product.json carries model list; skip remote refresh to save ~1s+RTT
+        // and avoid double ERROR spam on every exec (measured wall-time win).
+        {
+            let base = api_provider.base_url.to_ascii_lowercase();
+            if base.contains("codebuddy.ai") || base.contains("codebuddy.cn") {
+                return Ok((Vec::new(), None));
+            }
+        }
         let api_auth = resolve_provider_auth(auth.as_ref(), &self.provider_info)?;
         let request_url =
             ModelsClient::<ReqwestTransport>::request_url(&api_provider, client_version);

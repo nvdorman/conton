@@ -197,3 +197,40 @@ All changes confined to `codex-api` Conton bridge:
 Live smoke after fix (`/tmp/conton-smoke`): tools=`[Bash, write_stdin, update_plan, view_image]`, assistant tool message keys=`[role, tool_calls]`, Bash exec 0ms, total wall ~20s including cold binary start + 2 model round-trips.
 
 Env escape hatch: `CONTON_FULL_TOOLS=1` restores full Codex tool advertisement.
+
+## 8. Latency RE (2026-07-13 live numbers)
+
+### Pure edge (curl, same JWT/headers, gpt-5.5)
+
+| Body | effort | wall |
+|------|--------|------|
+| minimal system+user | low | ~3.5s |
+| minimal system+user | high | ~3.5s |
+| minimal system+user | xhigh | ~4.1s |
+| bloated system+tools | xhigh | ~3.1s (variance) |
+| user-only (no system) | xhigh | **11101** invalid |
+
+So for short pong, **effort is not the main driver**; API floor ≈ **3–4s**.
+
+### Conton `exec` wall (debug binary cold start)
+
+| | before slim | after slim (this fix) |
+|--|-------------|------------------------|
+| wire `reasoning_effort` | **high** (bug, user set xhigh) | **xhigh** |
+| tools advertised | 4–11 | **Bash only** |
+| system len | 3500–6200 | **~250** |
+| body bytes | ~8.5KB | **~2.2KB** |
+| `/models` 404 double | yes | **skipped** |
+| pong wall | ~13s | ~12s |
+| tool (Bash ls) wall | ~20s | ~18s |
+
+### Remaining gap vs CBC CLI (honest)
+
+CBC long-lived prewarmed Node process → first token after API floor only.  
+Conton `exec` **cold-starts** 1.4G debug Codex binary every time (~5–8s fixed).  
+That is **process model**, not model effort. Fix path: release binary + optional Conton daemon/prewarm (no Codex architecture change required for slim wire; daemon is launcher-level).
+
+### CBC primary agent path note
+
+Bundle builds OpenAI Responses-style bodies (`input`/`instructions`/`previous_response_id`) via `OpenAIResponsesModel` with `baseURL=${endpoint}/v2`.  
+Live `POST /v2/responses` returns **404** on public edge; CBC `axiosToFetchAdapter` rewrites/normalizes traffic and often lands on **`/v2/chat/completions`** (observed working). Conton correctly uses chat completions as the live edge path.
