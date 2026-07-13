@@ -234,3 +234,36 @@ That is **process model**, not model effort. Fix path: release binary + optional
 
 Bundle builds OpenAI Responses-style bodies (`input`/`instructions`/`previous_response_id`) via `OpenAIResponsesModel` with `baseURL=${endpoint}/v2`.  
 Live `POST /v2/responses` returns **404** on public edge; CBC `axiosToFetchAdapter` rewrites/normalizes traffic and often lands on **`/v2/chat/completions`** (observed working). Conton correctly uses chat completions as the live edge path.
+
+## 9. Wire parity + prewarm (post plan execution)
+
+### CBC live body (log, no secrets)
+
+```
+POST https://www.codebuddy.ai/v2/chat/completions
+temperature=1 stream=true stream_options.include_usage=true
+max_completion_tokens=72000 reasoning_effort=high|xhigh
+TTFT≈4576ms (gpt-5.5)
+```
+
+### Conton wire after fix (CONTON_STREAM_DEBUG dump)
+
+```
+temperature=1 max_completion_tokens=72000 stream_options={include_usage:true}
+reasoning_effort=xhigh tools=[Bash] system_len≈251 body≈2.3KB
+```
+
+### Wall times (debug binary, this machine)
+
+| Run | ms |
+|-----|-----|
+| CBC TTFT (log) | ~4576 |
+| Conton pong cold | ~9995 |
+| Conton pong warm (page cache + prewarm) | ~8745 |
+| Earlier Conton pong (pre-slim) | ~13000 |
+
+Gap to CBC is still process spawn (new codex process per exec) + MCP 451 noise, not effort/wire.
+
+### conton-prewarm
+
+`research/conton/bin/conton-prewarm {start|stop|status}` keeps binary page-cached under `~/.conton/prewarm`.

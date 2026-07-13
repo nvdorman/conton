@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Conton prewarm — keep a long-lived Conton/codex process warm (CBC cbc-prewarm analogue).
+# Does NOT change Codex architecture: just avoids cold-start of the multi‑GB binary.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE_DIR="${CONTON_PREWARM_DIR:-$HOME/.conton/prewarm}"
+PID_FILE="$STATE_DIR/codex.pid"
+LOG_FILE="$STATE_DIR/prewarm.log"
+SOCK_HINT="$STATE_DIR/README.txt"
+
+# Resolve vendor binary the same way as bin/conton
+VENDOR="${CONTON_VENDOR:-}"
+if [[ -z "$VENDOR" ]]; then
+  if [[ -d "$ROOT/vendor/codex/codex-rs" ]]; then
+    VENDOR="$ROOT/vendor/codex"
+  elif [[ -d "$ROOT/../codex-cli/codex-rs" ]]; then
+    VENDOR="$(cd "$ROOT/../codex-cli" && pwd)"
+  else
+    VENDOR="$ROOT/vendor/codex"
+  fi
+fi
+
+export CODEX_HOME="${CONTON_HOME:-${CODEX_HOME:-$HOME/.conton}}"
+export CONTON_HOME="$CODEX_HOME"
+mkdir -p "$CODEX_HOME" "$STATE_DIR"
+
+resolve_bin() {
+  if [[ -n "${CONTON_BIN:-}" && -x "${CONTON_BIN}" ]]; then
+    echo "$CONTON_BIN"
+    return
+  fi
+  for c in \
+    "$ROOT/dist/conton" \
+    "$ROOT/dist/codex" \
+    "$VENDOR/codex-rs/target/release/codex" \
+    "$VENDOR/codex-rs/target/debug/codex"
+  do
+    if [[ -x "$c" ]]; then
+      echo "$c"
+      return
+    fi
+  done
+  echo ""
+}
+
+is_running() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+cmd_start() {
+  local bin
+  bin="$(resolve_bin)"
+  if [[ -z "$bin" ]]; then
+    echo "[conton-prewarm] ERROR: no Conton/codex binary found" >&2
+    exit 127
+  fi
+  if is_running; then
+    echo "[conton-prewarm] already running pid=$(cat "$PID_FILE") bin=$bin CODEX_HOME=$CODEX_HOME"
+    exit 0
+  fi
+  # Touch auth + config so first real request is faster (load pages into page cache).
+  # Warm-up: run a no-op help (loads dynamic libs + config) then keep a sleep watchdog
+  # that holds the binary mapping. True multi-turn warm agent needs app-server attach;
+  # this still removes multi-second cold disk/page-fault cost on debug binaries.
+  {
+    echo "[conton-prewarm] $(date -Is) warming $bin"
+    # Load binary + dynamic deps into page cache
+    "$bin" --help >/dev/null 2>&1 || true
+    # Keep a placeholder process so status is meaningful; re-exec help periodically
+    # to keep pages warm without opening an interactive TUI.
+    while true; do
+      "$bin" --help >/dev/null 2>&1 || true
+      sleep 120
+    done
+  } >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
+  cat >"$SOCK_HINT" <<EOF
+Conton prewarm state dir: $STATE_DIR
+PID file: $PID_FILE
+Binary: $bin
+CODEX_HOME: $CODEX_HOME
+
+This keeps the Conton binary + dynamic libraries page-cached (CBC cbc-prewarm analogue for cold start).
+Interactive sessions still use: conton
+Non-interactive: conton exec ...
+
+For full agent warm attach (app-server IPC), set CONTON_PREWARM_MODE=app-server when available.
+EOF
+  echo "[conton-prewarm] started pid=$(cat "$PID_FILE") bin=$bin CODEX_HOME=$CODEX_HOME"
+  echo "[conton-prewarm] log=$LOG_FILE"
+}
+
+cmd_stop() {
+  if ! is_running; then
+    echo "[conton-prewarm] not running"
+    rm -f "$PID_FILE"
+    exit 0
+  fi
+  local pid
+  pid="$(cat "$PID_FILE")"
+  kill "$pid" 2>/dev/null || true
+  sleep 0.3
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+  echo "[conton-prewarm] stopped pid=$pid"
+}
+
+cmd_status() {
+  local bin
+  bin="$(resolve_bin)"
+  if is_running; then
+    echo "status=running pid=$(cat "$PID_FILE") bin=$bin CODEX_HOME=$CODEX_HOME"
+    exit 0
+  fi
+  echo "status=stopped bin=${bin:-missing} CODEX_HOME=$CODEX_HOME"
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage: conton-prewarm {start|stop|status}
+
+Keeps Conton binary warm under CODEX_HOME=~/.conton (never ~/.codex).
+Does not replace conton login/pool; only reduces cold-start latency.
+EOF
+}
+
+case "${1:-}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  -h|--help|help|"") usage; exit 0 ;;
+  *) echo "unknown command: $1" >&2; usage; exit 2 ;;
+esac

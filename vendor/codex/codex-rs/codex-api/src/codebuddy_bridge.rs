@@ -163,10 +163,20 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
         messages.push(json!({"role": "user", "content": "Continue."}));
     }
 
+    // Live CBC dump 2026-07-13 (codebuddy log captcha-solver session):
+    // POST https://www.codebuddy.ai/v2/chat/completions
+    // {"model":"gpt-5.5","tools":[...],"temperature":1,"stream":true,
+    //  "stream_options":{"include_usage":true},"reasoning_effort":"high",
+    //  "max_completion_tokens":72000}
+    // TTFT measured by CBC: ~4576ms for gpt-5.5 — that is the edge floor.
     let mut body = json!({
         "model": req.model,
         "messages": messages,
         "stream": true,
+        "temperature": 1,
+        "stream_options": { "include_usage": true },
+        // product.json gpt-5.5 maxOutputTokens = 72000
+        "max_completion_tokens": 72000,
     });
 
     if let Some(tools) = &req.tools {
@@ -178,7 +188,7 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
             } else {
                 json!(req.tool_choice)
             };
-            // RE CBC: parallel_tool_calls on model requests when tools present.
+            // Live CBC body includes parallel_tool_calls when tools present.
             body["parallel_tool_calls"] = json!(true);
         }
     }
@@ -187,6 +197,9 @@ pub fn responses_request_to_codebuddy_chat(req: &ResponsesApiRequest) -> Value {
         if let Some(effort) = reasoning_effort_str(reasoning) {
             body["reasoning_effort"] = json!(effort);
         }
+    } else {
+        // product.json gpt-5.5 default reasoning.effort = "high"
+        body["reasoning_effort"] = json!("high");
     }
 
     body
@@ -751,10 +764,56 @@ mod tests {
             .get("command")
             .is_some());
         assert_eq!(body["parallel_tool_calls"], true);
+        // Live CBC body parity (log 2026-07-13)
+        assert_eq!(body["temperature"], 1);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["max_completion_tokens"], 72000);
         // short system, not full Codex dump
         let sys = body["messages"][0]["content"].as_str().unwrap();
         assert!(sys.len() < 800, "system too long: {}", sys.len());
         assert!(sys.contains("Bash"));
+    }
+
+    #[test]
+    fn reasoning_effort_passes_xhigh() {
+        use crate::common::Reasoning;
+        use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+
+        let req = ResponsesApiRequest {
+            model: "gpt-5.5".into(),
+            instructions: "".into(),
+            input: vec![ResponseItem::Message {
+                id: None,
+                role: "user".into(),
+                content: vec![ContentItem::InputText {
+                    text: "pong".into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+            tools: None,
+            tool_choice: "auto".into(),
+            parallel_tool_calls: false,
+            reasoning: Some(Reasoning {
+                effort: Some(ReasoningEffortConfig::XHigh),
+                summary: None,
+                context: None,
+            }),
+            store: false,
+            stream: true,
+            stream_options: None,
+            include: vec![],
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+        let body = responses_request_to_codebuddy_chat(&req);
+        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert_eq!(body["max_completion_tokens"], 72000);
+        assert_eq!(body["temperature"], 1);
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[test]

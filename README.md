@@ -83,3 +83,18 @@ Use Actions artifacts + local import only.
 - `docs/OAUTH_REPLACE_IN_CODEX.md`
 - `docs/POOL_ROTATE.md`
 - `docs/AUTH_RE_LIVE.md`
+
+## Speed tips (vs CodeBuddy CLI)
+
+```bash
+# page-cache warm (reduces cold start of large debug binary)
+conton-prewarm start
+conton-prewarm status
+
+# daily use
+export PATH="$PWD/bin:$PATH"
+conton exec --skip-git-repo-check -c 'approval_policy="never"' "hello" </dev/null
+```
+
+Prefer GitHub Actions **release** artifact in `dist/conton` over `target/debug/codex` (1.4G).
+Edge floor for gpt-5.5 is ~4–5s TTFT (measured from CBC logs); Conton cannot beat that on the same network.
